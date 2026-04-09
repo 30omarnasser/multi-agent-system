@@ -9,6 +9,7 @@ services:
       - .env
     environment:
       - PYTHONPATH=/app
+      - OLLAMA_HOST=http://host.docker.internal:11434
     depends_on:
       - postgres
       - redis
