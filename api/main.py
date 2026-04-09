@@ -7,16 +7,28 @@ import os
 import traceback
 
 from agents.base_agent import BaseAgent
-
+from tools.registry import ToolRegistry
+from tools.definitions import calculator_tool, web_search_tool
 load_dotenv()
+from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
 
+registry = ToolRegistry()
+registry.register(calculator_tool)
+registry.register(web_search_tool)
+registry.register(python_executor_tool)   # ← add this line
 app = FastAPI(title="Multi-Agent System", version="0.1.0")
 
 agent = BaseAgent(
     name="AssistantAgent",
-    system_prompt="You are a helpful AI assistant that is part of a multi-agent system. You are clear, concise, and always explain your reasoning step by step.",
-    model="gemini-2.5-flash"
-
+    system_prompt=(
+        "You are a helpful AI assistant that is part of a multi-agent system. "
+        "Today's date is April 2026. "
+        "You are clear, concise, and always explain your reasoning step by step. "
+        "When asked to search for something, ALWAYS use the web_search tool. "
+        "When asked to run or write code, ALWAYS use the python_executor tool."
+    ),
+    model="gemini-2.5-flash",
+    registry=registry,
 )
 
 class ChatRequest(BaseModel):
@@ -81,3 +93,18 @@ def get_history():
 def clear_history():
     agent.clear_history()
     return {"message": "History cleared"}
+
+
+# Build registry
+registry = ToolRegistry()
+registry.register(calculator_tool)
+registry.register(web_search_tool)
+
+# Pass it to the agent
+agent = BaseAgent(
+    name="AssistantAgent",
+    system_prompt="You are a helpful AI assistant that is part of a multi-agent system. You are clear, concise, and always explain your reasoning step by step.",
+    model="gemini-2.5-flash",
+    registry=registry,        # ← this is the only new line
+)
+
