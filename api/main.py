@@ -10,6 +10,7 @@ from agents.base_agent import BaseAgent
 from tools.registry import ToolRegistry
 from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
 from memory.redis_memory import RedisMemory
+from memory.postgres_memory import PostgresMemory
 
 load_dotenv()
 
@@ -22,28 +23,31 @@ registry.register(calculator_tool)
 registry.register(web_search_tool)
 registry.register(python_executor_tool)
 
-memory = RedisMemory(ttl_seconds=3600)  # sessions live 1 hour
+short_term_memory = RedisMemory(ttl_seconds=3600)
+long_term_memory = PostgresMemory()
 
 SYSTEM_PROMPT = (
-    "You are a helpful AI assistant that is part of a multi-agent system. "
-    "Today's date is April 2026. "
-    "ALWAYS use your tools when asked — never refuse to search or run code. "
-    "You are clear, concise, and always explain your reasoning step by step."
+    "You are a helpful AI assistant. "
+    "Respond naturally and conversationally to the user. "
+    "When relevant facts from long-term memory are provided, use them naturally in your response. "
+    "NEVER output raw JSON, function call syntax, or tool definitions in your response. "
+    "Only use tools when explicitly asked to search, calculate, or run code."
 )
 
 agent = BaseAgent(
     name="AssistantAgent",
     system_prompt=SYSTEM_PROMPT,
-    model="llama3.2",
+    model="llama3.1:8b",
     registry=registry,
-    memory=memory,
+    memory=short_term_memory,
+    long_term_memory=long_term_memory,
 )
 
 # ─── Request/Response Models ──────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: str = "default"   # each user/conversation gets a unique ID
+    session_id: str = "default"
     clear_history: bool = False
 
 class ChatResponse(BaseModel):
@@ -54,10 +58,10 @@ class ChatResponse(BaseModel):
     input_tokens: int
     output_tokens: int
 
-class SessionInfo(BaseModel):
-    session_id: str
-    message_count: int
-    ttl_seconds: int
+class FactIn(BaseModel):
+    fact: str
+    category: str = "general"
+    session_id: str = "default"
 
 # ─── Endpoints ────────────────────────────────────────────────
 
@@ -68,12 +72,9 @@ def root():
 
 @app.get("/health")
 def health_check():
-    status = {"api": "ok", "redis": "unknown", "postgres": "unknown"}
+    status = {"api": "ok", "redis": "unknown", "postgres": "unknown", "ollama": "unknown"}
     try:
-        r = redis_lib.Redis(
-            host=os.getenv("REDIS_HOST"),
-            port=int(os.getenv("REDIS_PORT"))
-        )
+        r = redis_lib.Redis(host=os.getenv("REDIS_HOST"), port=int(os.getenv("REDIS_PORT")))
         r.ping()
         status["redis"] = "ok"
     except Exception as e:
@@ -90,6 +91,13 @@ def health_check():
         status["postgres"] = "ok"
     except Exception as e:
         status["postgres"] = f"error: {str(e)}"
+    try:
+        import ollama as ollama_client
+        client = ollama_client.Client(host=os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
+        client.list()
+        status["ollama"] = "ok"
+    except Exception as e:
+        status["ollama"] = f"error: {str(e)}"
     return status
 
 
@@ -99,12 +107,10 @@ def chat(request: ChatRequest):
         if request.clear_history:
             agent.load_session(request.session_id)
             agent.clear_history()
-
         result = agent.run(
             user_message=request.message,
             session_id=request.session_id,
         )
-
         return ChatResponse(
             response=result.content,
             agent_name=result.agent_name,
@@ -114,36 +120,60 @@ def chat(request: ChatRequest):
             output_tokens=result.output_tokens,
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"{str(e)}\n{traceback.format_exc()}"
-        )
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
 
 
 @app.get("/history/{session_id}")
 def get_history(session_id: str):
-    """Get full conversation history for a session."""
-    history = memory.get_history(session_id)
-    return {"session_id": session_id, "history": history}
+    return {"session_id": session_id, "history": short_term_memory.get_history(session_id)}
 
 
 @app.delete("/history/{session_id}")
 def clear_session(session_id: str):
-    """Delete all history for a session."""
-    memory.clear_session(session_id)
+    short_term_memory.clear_session(session_id)
     return {"message": f"Session '{session_id}' cleared"}
 
 
-@app.get("/sessions", response_model=list[SessionInfo])
+@app.get("/sessions")
 def list_sessions():
-    """List all active sessions with their message count and TTL."""
-    session_ids = memory.get_all_sessions()
-    result = []
-    for sid in session_ids:
-        history = memory.get_history(sid)
-        result.append(SessionInfo(
-            session_id=sid,
-            message_count=len(history),
-            ttl_seconds=memory.get_session_ttl(sid),
-        ))
-    return result
+    session_ids = short_term_memory.get_all_sessions()
+    return [
+        {
+            "session_id": sid,
+            "message_count": len(short_term_memory.get_history(sid)),
+            "ttl_seconds": short_term_memory.get_session_ttl(sid),
+        }
+        for sid in session_ids
+    ]
+
+
+@app.get("/facts")
+def get_all_facts(session_id: str = None):
+    facts = long_term_memory.get_all_facts(session_id=session_id)
+    return {"count": len(facts), "facts": facts}
+
+
+@app.post("/facts")
+def save_fact_manually(fact_in: FactIn):
+    long_term_memory.save_fact(
+        session_id=fact_in.session_id,
+        fact=fact_in.fact,
+        category=fact_in.category,
+    )
+    return {"message": "Fact saved successfully"}
+
+
+@app.get("/facts/search")
+def search_facts(query: str, session_id: str = None, top_k: int = 5):
+    facts = long_term_memory.search_facts(
+        query=query,
+        session_id=session_id,
+        top_k=top_k,
+    )
+    return {"query": query, "results": facts}
+
+
+@app.delete("/facts/{session_id}")
+def clear_facts(session_id: str):
+    long_term_memory.clear_session_facts(session_id)
+    return {"message": f"All facts cleared for session '{session_id}'"}
