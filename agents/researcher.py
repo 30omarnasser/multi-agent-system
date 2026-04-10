@@ -5,8 +5,8 @@ from tools.definitions import web_search_tool
 
 RESEARCHER_PROMPT = """You are a Researcher agent in a multi-agent AI system.
 Your job is to gather accurate, current information to answer the user's request.
-Use the search results provided to give a comprehensive research summary.
-Be factual, concise, and cite what you found.
+Use all the search results provided to give a comprehensive, well-structured summary.
+Be factual, cite sources where relevant, and organize findings clearly.
 Today's date is April 2026."""
 
 
@@ -20,24 +20,36 @@ class ResearcherAgent:
         print(f"[ResearcherAgent] Initialized | model: {self.model}")
 
     def run(self, state: AgentState) -> AgentState:
-        plan = state.get("plan", {})
         user_message = state["user_message"]
+        search_queries = state.get("search_queries", [])
+        plan = state.get("plan", {})
 
-        print(f"\n[ResearcherAgent] Researching: {user_message[:100]}")
+        print(f"\n[ResearcherAgent] Researching: '{user_message[:100]}'")
 
-        # Build search query from plan subtasks
-        subtasks = plan.get("subtasks", [user_message])
-        search_query = subtasks[0] if subtasks else user_message
+        # Use planner's search queries if available, else fall back to message
+        if not search_queries:
+            subtasks = plan.get("subtasks", [])
+            if subtasks:
+                first = subtasks[0]
+                search_queries = [first.get("description", user_message) if isinstance(first, dict) else first]
+            else:
+                search_queries = [user_message]
 
-        # Run web search
-        try:
-            raw_results = web_search_tool.run(query=search_query)
-            print(f"[ResearcherAgent] Search results: {raw_results[:200]}")
-        except Exception as e:
-            raw_results = f"Search failed: {e}"
-            print(f"[ResearcherAgent] Search error: {e}")
+        print(f"[ResearcherAgent] Search queries: {search_queries}")
 
-        # Summarize findings with LLM
+        # Run all search queries and collect results
+        all_results = []
+        for query in search_queries[:3]:  # cap at 3 searches
+            try:
+                result = web_search_tool.run(query=query)
+                all_results.append(f"Query: {query}\n{result}")
+                print(f"[ResearcherAgent] ✓ Searched: '{query}'")
+            except Exception as e:
+                print(f"[ResearcherAgent] ✗ Search failed for '{query}': {e}")
+
+        combined_results = "\n\n---\n\n".join(all_results) if all_results else "No search results found."
+
+        # Summarize with LLM
         try:
             response = self.ollama.chat(
                 model=self.model,
@@ -47,17 +59,18 @@ class ResearcherAgent:
                         "role": "user",
                         "content": (
                             f"User request: {user_message}\n\n"
-                            f"Search results:\n{raw_results}\n\n"
-                            f"Provide a clear research summary."
+                            f"Search results:\n{combined_results}\n\n"
+                            f"Provide a clear, well-structured research summary."
                         ),
                     },
                 ],
             )
             research_summary = response["message"]["content"].strip()
         except Exception as e:
-            research_summary = raw_results  # fallback to raw results
+            print(f"[ResearcherAgent] Summarization failed: {e}")
+            research_summary = combined_results
 
-        print(f"[ResearcherAgent] Summary: {research_summary[:200]}")
+        print(f"[ResearcherAgent] Summary ({len(research_summary)} chars): {research_summary[:200]}")
 
         return {
             **state,
