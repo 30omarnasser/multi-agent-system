@@ -7,7 +7,7 @@ import os
 import traceback
 
 from agents.base_agent import BaseAgent
-from agents.graph import get_graph
+from agents.graph import pipeline
 from agents.state import AgentState
 from tools.registry import ToolRegistry
 from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
@@ -31,23 +31,19 @@ long_term_memory = PostgresMemory()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
-    "When relevant facts from long-term memory are provided, use them naturally in your response. "
+    "When relevant facts from long-term memory are provided, use them naturally. "
     "NEVER output raw JSON, function call syntax, or tool definitions in your response. "
     "Only use tools when explicitly asked to search, calculate, or run code."
 )
 
-# Single agent (Week 1)
 agent = BaseAgent(
     name="AssistantAgent",
     system_prompt=SYSTEM_PROMPT,
-    model="llama3.1:8b",
+    model="llama3.2",
     registry=registry,
     memory=short_term_memory,
     long_term_memory=long_term_memory,
 )
-
-# Multi-agent graph (Week 2)
-graph = get_graph(model="llama3.1:8b")
 
 # ─── Request / Response Models ────────────────────────────────
 
@@ -72,8 +68,9 @@ class MultiAgentResponse(BaseModel):
     response: str
     session_id: str
     plan: dict
-    critique: dict
     agents_used: list[str]
+    had_revision: bool
+    critique_score: int
 
 class FactIn(BaseModel):
     fact: str
@@ -123,7 +120,7 @@ def health_check():
     return status
 
 
-# ─── Single Agent (Week 1) ────────────────────────────────────
+# ─── Single Agent — Week 1 ────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
@@ -150,10 +147,10 @@ def chat(request: ChatRequest):
         )
 
 
-# ─── Multi-Agent Graph (Week 2) ───────────────────────────────
+# ─── Multi-Agent Pipeline — Week 2 ───────────────────────────
 
 @app.post("/multi-agent", response_model=MultiAgentResponse)
-def multi_agent_chat(request: MultiAgentRequest):
+def multi_agent(request: MultiAgentRequest):
     try:
         initial_state: AgentState = {
             "user_message": request.message,
@@ -165,9 +162,15 @@ def multi_agent_chat(request: MultiAgentRequest):
             "final_response": "",
             "current_agent": "",
             "session_id": request.session_id,
+            "search_queries": [],
+            "code_requirements": [],
         }
 
-        final_state = graph.invoke(initial_state)
+        print(f"\n{'='*55}")
+        print(f"[Pipeline] Starting: '{request.message[:80]}'")
+        print(f"{'='*55}")
+
+        final_state = pipeline.invoke(initial_state)
 
         agents_used = []
         if final_state.get("plan"):
@@ -178,15 +181,22 @@ def multi_agent_chat(request: MultiAgentRequest):
             agents_used.append("coder")
         if final_state.get("critique"):
             agents_used.append("critic")
-        agents_used.append("responder")
+        if final_state.get("final_response"):
+            agents_used.append("responder")
+
+        critique = final_state.get("critique", {})
+
+        print(f"[Pipeline] ✓ Complete | agents: {agents_used}")
 
         return MultiAgentResponse(
-            response=final_state["final_response"],
+            response=final_state.get("final_response", "No response generated."),
             session_id=request.session_id,
             plan=final_state.get("plan", {}),
-            critique=final_state.get("critique", {}),
             agents_used=agents_used,
+            had_revision=final_state.get("revision_count", 0) > 0,
+            critique_score=critique.get("score", 0),
         )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -194,7 +204,7 @@ def multi_agent_chat(request: MultiAgentRequest):
         )
 
 
-# ─── Session / History Endpoints ──────────────────────────────
+# ─── Session / History ────────────────────────────────────────
 
 @app.get("/history/{session_id}")
 def get_history(session_id: str):
@@ -223,7 +233,7 @@ def list_sessions():
     ]
 
 
-# ─── Facts / Long-term Memory Endpoints ──────────────────────
+# ─── Long-term Memory / Facts ─────────────────────────────────
 
 @app.get("/facts")
 def get_all_facts(session_id: str = None):
