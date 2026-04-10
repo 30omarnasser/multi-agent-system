@@ -7,6 +7,8 @@ import os
 import traceback
 
 from agents.base_agent import BaseAgent
+from agents.graph import get_graph
+from agents.state import AgentState
 from tools.registry import ToolRegistry
 from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
 from memory.redis_memory import RedisMemory
@@ -14,9 +16,9 @@ from memory.postgres_memory import PostgresMemory
 
 load_dotenv()
 
-app = FastAPI(title="Multi-Agent System", version="0.1.0")
+app = FastAPI(title="Multi-Agent System", version="0.2.0")
 
-# ─── Setup ────────────────────────────────────────────────────
+# ─── Services Setup ───────────────────────────────────────────
 
 registry = ToolRegistry()
 registry.register(calculator_tool)
@@ -34,6 +36,7 @@ SYSTEM_PROMPT = (
     "Only use tools when explicitly asked to search, calculate, or run code."
 )
 
+# Single agent (Week 1)
 agent = BaseAgent(
     name="AssistantAgent",
     system_prompt=SYSTEM_PROMPT,
@@ -43,7 +46,10 @@ agent = BaseAgent(
     long_term_memory=long_term_memory,
 )
 
-# ─── Request/Response Models ──────────────────────────────────
+# Multi-agent graph (Week 2)
+graph = get_graph(model="llama3.1:8b")
+
+# ─── Request / Response Models ────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
@@ -58,23 +64,37 @@ class ChatResponse(BaseModel):
     input_tokens: int
     output_tokens: int
 
+class MultiAgentRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+
+class MultiAgentResponse(BaseModel):
+    response: str
+    session_id: str
+    plan: dict
+    critique: dict
+    agents_used: list[str]
+
 class FactIn(BaseModel):
     fact: str
     category: str = "general"
     session_id: str = "default"
 
-# ─── Endpoints ────────────────────────────────────────────────
+# ─── Core Endpoints ───────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"message": "Multi-Agent System is running 🤖"}
+    return {"message": "Multi-Agent System is running 🤖", "version": "0.2.0"}
 
 
 @app.get("/health")
 def health_check():
     status = {"api": "ok", "redis": "unknown", "postgres": "unknown", "ollama": "unknown"}
     try:
-        r = redis_lib.Redis(host=os.getenv("REDIS_HOST"), port=int(os.getenv("REDIS_PORT")))
+        r = redis_lib.Redis(
+            host=os.getenv("REDIS_HOST", "redis"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+        )
         r.ping()
         status["redis"] = "ok"
     except Exception as e:
@@ -93,13 +113,17 @@ def health_check():
         status["postgres"] = f"error: {str(e)}"
     try:
         import ollama as ollama_client
-        client = ollama_client.Client(host=os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434"))
+        client = ollama_client.Client(
+            host=os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        )
         client.list()
         status["ollama"] = "ok"
     except Exception as e:
         status["ollama"] = f"error: {str(e)}"
     return status
 
+
+# ─── Single Agent (Week 1) ────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
@@ -120,12 +144,64 @@ def chat(request: ChatRequest):
             output_tokens=result.output_tokens,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"{str(e)}\n{traceback.format_exc()}",
+        )
 
+
+# ─── Multi-Agent Graph (Week 2) ───────────────────────────────
+
+@app.post("/multi-agent", response_model=MultiAgentResponse)
+def multi_agent_chat(request: MultiAgentRequest):
+    try:
+        initial_state: AgentState = {
+            "user_message": request.message,
+            "plan": {},
+            "research": "",
+            "code_output": "",
+            "critique": {},
+            "revision_count": 0,
+            "final_response": "",
+            "current_agent": "",
+            "session_id": request.session_id,
+        }
+
+        final_state = graph.invoke(initial_state)
+
+        agents_used = []
+        if final_state.get("plan"):
+            agents_used.append("planner")
+        if final_state.get("research"):
+            agents_used.append("researcher")
+        if final_state.get("code_output"):
+            agents_used.append("coder")
+        if final_state.get("critique"):
+            agents_used.append("critic")
+        agents_used.append("responder")
+
+        return MultiAgentResponse(
+            response=final_state["final_response"],
+            session_id=request.session_id,
+            plan=final_state.get("plan", {}),
+            critique=final_state.get("critique", {}),
+            agents_used=agents_used,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{str(e)}\n{traceback.format_exc()}",
+        )
+
+
+# ─── Session / History Endpoints ──────────────────────────────
 
 @app.get("/history/{session_id}")
 def get_history(session_id: str):
-    return {"session_id": session_id, "history": short_term_memory.get_history(session_id)}
+    return {
+        "session_id": session_id,
+        "history": short_term_memory.get_history(session_id),
+    }
 
 
 @app.delete("/history/{session_id}")
@@ -146,6 +222,8 @@ def list_sessions():
         for sid in session_ids
     ]
 
+
+# ─── Facts / Long-term Memory Endpoints ──────────────────────
 
 @app.get("/facts")
 def get_all_facts(session_id: str = None):

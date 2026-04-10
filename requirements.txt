@@ -10,3 +10,5 @@ tavily-python==0.3.3
 ollama==0.3.3
 pgvector==0.2.5
 numpy==1.26.4
+langgraph==0.2.55
+langchain-core==0.3.28
