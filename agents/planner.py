@@ -152,7 +152,7 @@ class PlannerAgent:
             "reasoning": "Default plan.",
         }
         for key, value in defaults.items():
-            if key not in plan:
+            if key not in plan or plan[key] is None:
                 plan[key] = value
 
         # Fix type mismatches

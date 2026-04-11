@@ -67,3 +67,5 @@ class AgentState(TypedDict):
     # Planner metadata — used by downstream agents
     search_queries: list      # exact queries for Researcher
     code_requirements: list   # exact requirements for Coder
+    
+    doc_context: str 

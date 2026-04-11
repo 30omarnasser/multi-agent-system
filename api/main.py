@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import redis as redis_lib
@@ -13,12 +13,12 @@ from tools.registry import ToolRegistry
 from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
 from memory.redis_memory import RedisMemory
 from memory.postgres_memory import PostgresMemory
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from rag.ingestion import DocumentIngestion
 from rag.retriever import DocumentRetriever
+
 load_dotenv()
 
-app = FastAPI(title="Multi-Agent System", version="0.2.0")
+app = FastAPI(title="Multi-Agent System", version="0.3.0")
 
 # ─── Services Setup ───────────────────────────────────────────
 
@@ -31,6 +31,7 @@ short_term_memory = RedisMemory(ttl_seconds=3600)
 long_term_memory = PostgresMemory()
 doc_ingestion = DocumentIngestion()
 doc_retriever = DocumentRetriever()
+
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -42,7 +43,7 @@ SYSTEM_PROMPT = (
 agent = BaseAgent(
     name="AssistantAgent",
     system_prompt=SYSTEM_PROMPT,
-    model="llama3.2",
+    model="llama3.1:8b",
     registry=registry,
     memory=short_term_memory,
     long_term_memory=long_term_memory,
@@ -71,6 +72,7 @@ class MultiAgentResponse(BaseModel):
     response: str
     session_id: str
     plan: dict
+    critique: dict
     agents_used: list[str]
     had_revision: bool
     critique_score: int
@@ -84,7 +86,7 @@ class FactIn(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Multi-Agent System is running 🤖", "version": "0.2.0"}
+    return {"message": "Multi-Agent System is running 🤖", "version": "0.3.0"}
 
 
 @app.get("/health")
@@ -150,7 +152,7 @@ def chat(request: ChatRequest):
         )
 
 
-# ─── Multi-Agent Pipeline — Week 2 ───────────────────────────
+# ─── Multi-Agent Pipeline — Week 2+ ──────────────────────────
 
 @app.post("/multi-agent", response_model=MultiAgentResponse)
 def multi_agent(request: MultiAgentRequest):
@@ -167,14 +169,16 @@ def multi_agent(request: MultiAgentRequest):
             "session_id": request.session_id,
             "search_queries": [],
             "code_requirements": [],
+            "doc_context": "",
         }
 
-        print(f"\n{'='*55}")
+        print(f"\n{'=' * 55}")
         print(f"[Pipeline] Starting: '{request.message[:80]}'")
-        print(f"{'='*55}")
+        print(f"{'=' * 55}")
 
         final_state = pipeline.invoke(initial_state)
 
+        # Track which agents actually ran
         agents_used = []
         if final_state.get("plan"):
             agents_used.append("planner")
@@ -187,17 +191,20 @@ def multi_agent(request: MultiAgentRequest):
         if final_state.get("final_response"):
             agents_used.append("responder")
 
-        critique = final_state.get("critique", {})
+        critique = final_state.get("critique") or {}
+        critique_score = int(critique.get("score", 0)) if critique.get("score") else 0
+        had_revision = (final_state.get("revision_count", 0) > 1)
 
         print(f"[Pipeline] ✓ Complete | agents: {agents_used}")
 
         return MultiAgentResponse(
-            response=final_state.get("final_response", "No response generated."),
+            response=final_state.get("final_response", ""),
             session_id=request.session_id,
-            plan=final_state.get("plan", {}),
+            plan=final_state.get("plan") or {},
+            critique=critique,
             agents_used=agents_used,
-            had_revision=final_state.get("revision_count", 0) > 0,
-            critique_score=critique.get("score", 0),
+            had_revision=had_revision,
+            critique_score=critique_score,
         )
 
     except Exception as e:
@@ -268,6 +275,8 @@ def search_facts(query: str, session_id: str = None, top_k: int = 5):
 def clear_facts(session_id: str):
     long_term_memory.clear_session_facts(session_id)
     return {"message": f"All facts cleared for session '{session_id}'"}
+
+
 # ─── RAG / Document Endpoints ─────────────────────────────────
 
 @app.post("/upload-pdf")
@@ -307,9 +316,8 @@ def search_documents(
     top_k: int = 5,
     threshold: float = 0.2,
     doc_id: str = None,
-    mode: str = "hybrid",   # ← NEW: hybrid | vector | keyword
+    mode: str = "hybrid",
 ):
-    """Hybrid search over ingested documents."""
     results = doc_retriever.search(
         query=query,
         top_k=top_k,
@@ -330,9 +338,8 @@ def get_doc_context(
     query: str,
     top_k: int = 5,
     doc_id: str = None,
-    mode: str = "hybrid",   # ← NEW
+    mode: str = "hybrid",
 ):
-    """Get formatted context string ready for LLM injection."""
     context = doc_retriever.search_and_format(
         query=query,
         top_k=top_k,
@@ -348,7 +355,6 @@ def compare_search_modes(
     top_k: int = 5,
     doc_id: str = None,
 ):
-    """Compare all 3 search modes side by side — useful for debugging."""
     vector_results = doc_retriever.search(
         query=query, top_k=top_k, doc_id=doc_id, mode="vector"
     )
