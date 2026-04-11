@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import os
 from ui.components.traces import render_trace_viewer
+from ui.components.evaluation import render_evaluation_dashboard
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
@@ -103,10 +104,10 @@ def render_status_bar():
 # ─── Navigation ───────────────────────────────────────────────
 
 def render_navigation():
-    """Top navigation tabs."""
     return st.tabs([
         "💬 Chat",
-         "🔍 Traces",
+        "🔍 Traces",
+        "📊 Evaluation",     # ← NEW
         "🧠 Memory",
         "📄 Documents",
         "ℹ️ About",
@@ -177,17 +178,15 @@ def main():
 
     with tabs[0]:
         render_chat_interface()
-
     with tabs[1]:
-        render_trace_viewer()          # ← NEW
-
+        render_trace_viewer()
     with tabs[2]:
-        render_memory_explorer()
-
+        render_evaluation_dashboard()    # ← NEW
     with tabs[3]:
-        render_documents_panel()
-
+        render_memory_explorer()
     with tabs[4]:
+        render_documents_panel()
+    with tabs[5]:
         render_about()
 
 if __name__ == "__main__":

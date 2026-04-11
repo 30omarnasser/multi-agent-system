@@ -5,7 +5,8 @@ import redis as redis_lib
 import psycopg2
 import os
 import traceback
-
+from evaluation.evaluator import EvaluationEngine
+from evaluation.eval_store import EvalStore
 from agents.base_agent import BaseAgent
 from agents.graph import pipeline
 from agents.state import AgentState
@@ -38,6 +39,8 @@ episodic_memory = EpisodicMemory()
 user_profile_memory = UserProfileMemory()
 memory_manager = MemoryManager()
 trace_store = TraceStore()
+evaluator = EvaluationEngine(model="llama3.1:8b")
+eval_store = EvalStore()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -267,7 +270,27 @@ def multi_agent(request: MultiAgentRequest):
         )
 
         print(f"[Pipeline] ✓ Complete | agents: {agents_used} | {total_duration_ms}ms")
-
+        # ── Evaluate the response asynchronously ──────────────
+        try:
+            scores = evaluator.evaluate(
+                user_message=request.message,
+                response=final_state.get("final_response", ""),
+                agents_used=agents_used,
+                task_type=final_state.get("plan", {}).get("task_type", "simple"),
+                had_revision=had_revision,
+                research=final_state.get("research", ""),
+                code_output=final_state.get("code_output", ""),
+                trace_id=trace_id,
+            )
+            eval_store.save_evaluation(
+                session_id=request.session_id,
+                user_message=request.message,
+                response=final_state.get("final_response", ""),
+                scores=scores,
+                had_revision=had_revision,
+            )
+        except Exception as e:
+            print(f"[API] Evaluation failed (non-critical): {e}")
         return MultiAgentResponse(
             response=final_state.get("final_response", ""),
             session_id=request.session_id,
@@ -612,3 +635,51 @@ def clear_old_traces(days_old: int = 7):
     """Delete traces older than N days."""
     deleted = trace_store.clear_old_traces(days_old=days_old)
     return {"deleted": deleted, "days_old": days_old}
+    
+# ─── Evaluation Endpoints ─────────────────────────────────────
+
+@app.get("/evaluations")
+def list_evaluations(
+    session_id: str = None,
+    task_type: str = None,
+    min_score: int = 0,
+    limit: int = 20,
+):
+    """List evaluation results with optional filters."""
+    evals = eval_store.list_evaluations(
+        session_id=session_id,
+        task_type=task_type,
+        min_score=min_score,
+        limit=limit,
+    )
+    return {"count": len(evals), "evaluations": evals}
+
+
+@app.get("/evaluations/stats")
+def get_evaluation_stats():
+    """Aggregate quality stats across all evaluations."""
+    stats = eval_store.get_aggregate_stats()
+    return stats
+
+
+@app.get("/evaluations/{eval_id}")
+def get_evaluation(eval_id: int):
+    """Get a specific evaluation by ID."""
+    ev = eval_store.get_evaluation(eval_id)
+    if not ev:
+        raise HTTPException(status_code=404, detail=f"Evaluation {eval_id} not found")
+    return ev
+
+
+@app.delete("/evaluations/{eval_id}")
+def delete_evaluation(eval_id: int):
+    """Delete a specific evaluation."""
+    eval_store.delete_evaluation(eval_id)
+    return {"message": f"Evaluation {eval_id} deleted"}
+
+
+@app.delete("/evaluations")
+def clear_evaluations(session_id: str = None):
+    """Clear all evaluations, optionally for a specific session."""
+    deleted = eval_store.clear_evaluations(session_id=session_id)
+    return {"deleted": deleted}
