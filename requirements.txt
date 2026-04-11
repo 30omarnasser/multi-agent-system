@@ -12,3 +12,5 @@ pgvector==0.2.5
 numpy==1.26.4
 langgraph==0.2.55
 langchain-core==0.3.28
+pypdf==4.2.0
+python-multipart==0.0.9

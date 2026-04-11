@@ -13,7 +13,9 @@ from tools.registry import ToolRegistry
 from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
 from memory.redis_memory import RedisMemory
 from memory.postgres_memory import PostgresMemory
-
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from rag.ingestion import DocumentIngestion
+from rag.retriever import DocumentRetriever
 load_dotenv()
 
 app = FastAPI(title="Multi-Agent System", version="0.2.0")
@@ -27,7 +29,8 @@ registry.register(python_executor_tool)
 
 short_term_memory = RedisMemory(ttl_seconds=3600)
 long_term_memory = PostgresMemory()
-
+doc_ingestion = DocumentIngestion()
+doc_retriever = DocumentRetriever()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -265,3 +268,108 @@ def search_facts(query: str, session_id: str = None, top_k: int = 5):
 def clear_facts(session_id: str):
     long_term_memory.clear_session_facts(session_id)
     return {"message": f"All facts cleared for session '{session_id}'"}
+# ─── RAG / Document Endpoints ─────────────────────────────────
+
+@app.post("/upload-pdf")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    doc_id: str = Form(None),
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    try:
+        pdf_bytes = await file.read()
+        result = doc_ingestion.ingest_pdf(
+            pdf_bytes=pdf_bytes,
+            filename=file.filename,
+            doc_id=doc_id,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/documents")
+def list_documents():
+    docs = doc_ingestion.list_documents()
+    return {"count": len(docs), "documents": docs}
+
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: str):
+    deleted = doc_ingestion.delete_document(doc_id)
+    return {"message": f"Deleted {deleted} chunks for doc_id='{doc_id}'"}
+
+
+@app.get("/search-docs")
+def search_documents(
+    query: str,
+    top_k: int = 5,
+    threshold: float = 0.2,
+    doc_id: str = None,
+    mode: str = "hybrid",   # ← NEW: hybrid | vector | keyword
+):
+    """Hybrid search over ingested documents."""
+    results = doc_retriever.search(
+        query=query,
+        top_k=top_k,
+        threshold=threshold,
+        doc_id=doc_id,
+        mode=mode,
+    )
+    return {
+        "query": query,
+        "mode": mode,
+        "count": len(results),
+        "results": results,
+    }
+
+
+@app.get("/search-docs/context")
+def get_doc_context(
+    query: str,
+    top_k: int = 5,
+    doc_id: str = None,
+    mode: str = "hybrid",   # ← NEW
+):
+    """Get formatted context string ready for LLM injection."""
+    context = doc_retriever.search_and_format(
+        query=query,
+        top_k=top_k,
+        doc_id=doc_id,
+        mode=mode,
+    )
+    return {"query": query, "mode": mode, "context": context}
+
+
+@app.get("/search-docs/compare")
+def compare_search_modes(
+    query: str,
+    top_k: int = 5,
+    doc_id: str = None,
+):
+    """Compare all 3 search modes side by side — useful for debugging."""
+    vector_results = doc_retriever.search(
+        query=query, top_k=top_k, doc_id=doc_id, mode="vector"
+    )
+    keyword_results = doc_retriever.search(
+        query=query, top_k=top_k, doc_id=doc_id, mode="keyword"
+    )
+    hybrid_results = doc_retriever.search(
+        query=query, top_k=top_k, doc_id=doc_id, mode="hybrid"
+    )
+    return {
+        "query": query,
+        "vector": {
+            "count": len(vector_results),
+            "results": [{"text": r["text"][:100], "score": r.get("similarity")} for r in vector_results],
+        },
+        "keyword": {
+            "count": len(keyword_results),
+            "results": [{"text": r["text"][:100], "score": r.get("keyword_score")} for r in keyword_results],
+        },
+        "hybrid": {
+            "count": len(hybrid_results),
+            "results": [{"text": r["text"][:100], "score": r.get("rrf_score")} for r in hybrid_results],
+        },
+    }
