@@ -19,6 +19,8 @@ from memory.episodic_memory import EpisodicMemory
 from memory.user_profile import UserProfileMemory
 load_dotenv()
 from memory.memory_manager import MemoryManager
+from memory.trace_store import TraceStore
+from agents.traced_graph import traced_pipeline
 app = FastAPI(title="Multi-Agent System", version="0.3.0")
 
 # ─── Services Setup ───────────────────────────────────────────
@@ -35,6 +37,7 @@ doc_retriever = DocumentRetriever()
 episodic_memory = EpisodicMemory()
 user_profile_memory = UserProfileMemory()
 memory_manager = MemoryManager()
+trace_store = TraceStore()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -160,26 +163,27 @@ def chat(request: ChatRequest):
 
 @app.post("/multi-agent", response_model=MultiAgentResponse)
 def multi_agent(request: MultiAgentRequest):
+    import time
+    pipeline_start = time.time()
+
     try:
-        # ── Step 1: Save user message to Redis BEFORE pipeline runs ──
-        # This ensures save_episode_node can read it from Redis
+        # Save user message to Redis
         try:
             short_term_memory.save_message(
                 request.session_id, "user", request.message
             )
-            print(f"[API] Saved user message to Redis for '{request.session_id}'")
         except Exception as e:
             print(f"[API] Redis pre-save failed: {e}")
-        # ── Recall user profile ───────────────────────────────────
+
+        # Recall user profile
         profile_context = ""
         try:
             uid = request.user_id or request.session_id
             profile_context = user_profile_memory.format_for_prompt(uid)
-            if profile_context:
-                print(f"[API] 👤 Profile context loaded for '{uid}'")
         except Exception as e:
-            print(f"[API] Profile recall failed (non-critical): {e}")
-        # ── Step 2: Recall relevant past episodes ─────────────────────
+            print(f"[API] Profile recall failed: {e}")
+
+        # Recall past episodes
         episode_context = ""
         try:
             past_episodes = episodic_memory.search_episodes(
@@ -190,11 +194,15 @@ def multi_agent(request: MultiAgentRequest):
             )
             if past_episodes:
                 episode_context = episodic_memory.format_episodes_for_prompt(past_episodes)
-                print(f"[API] 🧠 Recalled {len(past_episodes)} past episodes")
         except Exception as e:
-            print(f"[API] Episode recall failed (non-critical): {e}")
+            print(f"[API] Episode recall failed: {e}")
 
-        # ── Step 3: Build initial state and run pipeline ──────────────
+        # Create trace
+        trace_id = trace_store.create_trace(
+            session_id=request.session_id,
+            user_message=request.message,
+        )
+
         initial_state: AgentState = {
             "user_message": request.message,
             "plan": {},
@@ -205,33 +213,31 @@ def multi_agent(request: MultiAgentRequest):
             "final_response": "",
             "current_agent": "",
             "session_id": request.session_id,
-            "user_id": request.user_id or request.session_id,  # ← NEW
+            "user_id": request.user_id or request.session_id,
             "search_queries": [],
             "code_requirements": [],
             "doc_context": "",
             "episode_context": episode_context,
-            "profile_context": profile_context,  # ← NEW
+            "profile_context": profile_context,
+            "trace_id": trace_id,             # ← pass trace_id into state
         }
 
         print(f"\n{'=' * 55}")
         print(f"[Pipeline] Starting: '{request.message[:80]}'")
+        print(f"[Pipeline] Trace ID: {trace_id}")
         print(f"{'=' * 55}")
 
-        final_state = pipeline.invoke(initial_state)
+        final_state = traced_pipeline.invoke(initial_state)
 
-        # ── Step 4: Save assistant response to Redis AFTER pipeline ───
-        # save_episode_node already ran inside pipeline, but we save
-        # the response here for future episode recalls
+        # Save assistant response
         try:
             short_term_memory.save_message(
                 request.session_id, "assistant",
                 final_state.get("final_response", "")
             )
-            print(f"[API] Saved assistant response to Redis for '{request.session_id}'")
         except Exception as e:
             print(f"[API] Redis post-save failed: {e}")
 
-        # ── Step 5: Build response ────────────────────────────────────
         agents_used = []
         if final_state.get("plan"):
             agents_used.append("planner")
@@ -247,8 +253,20 @@ def multi_agent(request: MultiAgentRequest):
         critique = final_state.get("critique") or {}
         critique_score = int(critique.get("score", 0)) if critique.get("score") else 0
         had_revision = (final_state.get("revision_count", 0) > 1)
+        total_duration_ms = int((time.time() - pipeline_start) * 1000)
 
-        print(f"[Pipeline] ✓ Complete | agents: {agents_used}")
+        # Complete the trace
+        trace_store.complete_trace(
+            trace_id=trace_id,
+            final_response=final_state.get("final_response", ""),
+            agents_used=agents_used,
+            total_duration_ms=total_duration_ms,
+            critique_score=critique_score,
+            had_revision=had_revision,
+            task_type=final_state.get("plan", {}).get("task_type", "simple"),
+        )
+
+        print(f"[Pipeline] ✓ Complete | agents: {agents_used} | {total_duration_ms}ms")
 
         return MultiAgentResponse(
             response=final_state.get("final_response", ""),
@@ -264,9 +282,7 @@ def multi_agent(request: MultiAgentRequest):
         raise HTTPException(
             status_code=500,
             detail=f"{str(e)}\n{traceback.format_exc()}",
-        )
-
-
+            )
 # ─── Session / History ────────────────────────────────────────
 
 @app.get("/history/{session_id}")
@@ -559,3 +575,40 @@ def get_document_stats():
     """Per-document chunk counts and sizes."""
     stats = memory_manager.get_document_stats()
     return {"count": len(stats), "documents": stats}
+# ─── Trace Endpoints ──────────────────────────────────────────
+
+@app.get("/traces")
+def list_traces(session_id: str = None, limit: int = 20):
+    """List recent pipeline execution traces."""
+    traces = trace_store.list_traces(session_id=session_id, limit=limit)
+    return {"count": len(traces), "traces": traces}
+
+
+@app.get("/traces/stats")
+def get_trace_stats():
+    """Aggregate performance stats across all traces."""
+    stats = trace_store.get_stats()
+    return stats
+
+
+@app.get("/traces/{trace_id}")
+def get_trace(trace_id: str):
+    """Get full trace with all agent spans."""
+    trace = trace_store.get_trace(trace_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail=f"Trace '{trace_id}' not found")
+    return trace
+
+
+@app.delete("/traces/{trace_id}")
+def delete_trace(trace_id: str):
+    """Delete a trace and all its spans."""
+    trace_store.delete_trace(trace_id)
+    return {"message": f"Trace '{trace_id}' deleted"}
+
+
+@app.delete("/traces")
+def clear_old_traces(days_old: int = 7):
+    """Delete traces older than N days."""
+    deleted = trace_store.clear_old_traces(days_old=days_old)
+    return {"deleted": deleted, "days_old": days_old}

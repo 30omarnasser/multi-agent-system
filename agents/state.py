@@ -40,3 +40,4 @@ class AgentState(TypedDict):
     # Memory contexts injected at start
     episode_context: str
     profile_context: str  # ← NEW: user profile context
+    trace_id: str 
