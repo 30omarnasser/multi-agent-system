@@ -64,14 +64,13 @@ def test_profile_updates_with_interactions():
 
 def test_profile_personalization():
     log("Test 3: Response is personalized based on profile")
-    time.sleep(2)
-
+    time.sleep(5)  # ← increase from 2 to 5
     r = requests.post(f"{BASE_URL}/multi-agent", json={
         "message": "Explain what a Python decorator is.",
         "session_id": "profile_test_003",
         "user_id": "user_omar",
     })
-    assert r.status_code == 200
+    assert r.status_code == 200, f"Got {r.status_code}: {r.text[:300]}"
     response_text = r.json()["response"]
     print(f"  Response (first 300 chars): {response_text[:300]}")
     assert len(response_text) > 50
@@ -100,7 +99,7 @@ def test_manual_profile_update():
 
 def test_profile_context_in_pipeline():
     log("Test 5: Profile context injected into pipeline")
-    time.sleep(2)
+    time.sleep(5)  # ← was 2
 
     r = requests.post(f"{BASE_URL}/multi-agent", json={
         "message": "What should I learn next to improve as a developer?",
