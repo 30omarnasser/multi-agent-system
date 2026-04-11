@@ -8,11 +8,10 @@ from agents.critic import CriticAgent
 from agents.responder import ResponderAgent
 
 MAX_REVISIONS = 2
-DEFAULT_MODEL = os.getenv("AGENT_MODEL", "llama3.2")
+DEFAULT_MODEL = os.getenv("AGENT_MODEL", "llama3.1:8b")
 
 
 def build_graph(model: str = DEFAULT_MODEL):
-    """Build and compile the multi-agent LangGraph."""
 
     planner = PlannerAgent(model=model)
     researcher = ResearcherAgent(model=model)
@@ -20,12 +19,51 @@ def build_graph(model: str = DEFAULT_MODEL):
     critic = CriticAgent(model=model)
     responder = ResponderAgent(model=model)
 
+    # ─── Episodic Memory Node ──────────────────────────────────
+
+    def save_episode_node(state: AgentState) -> AgentState:
+        print(f"[Graph] save_episode_node triggered | session: {state.get('session_id')}")
+        try:
+            from memory.episodic_memory import EpisodicMemory
+
+            session_id = state.get("session_id", "default")
+            if not session_id or session_id == "default":
+                print(f"[Graph] Skipping — session_id is 'default'")
+                return state
+
+            # Build messages directly from state — no Redis dependency
+            user_message = state.get("user_message", "")
+            final_response = state.get("final_response", "")
+
+            if not user_message or not final_response:
+                print(f"[Graph] Skipping — missing user_message or final_response")
+                return state
+
+            messages = [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": final_response},
+            ]
+
+            episodic = EpisodicMemory()
+            result = episodic.save_episode(
+                session_id=session_id,
+                messages=messages,
+                model=model,
+            )
+            print(f"[Graph] ✓ Episode saved: id={result.get('id')}")
+
+        except Exception as e:
+            import traceback as tb
+            print(f"[Graph] Episode save FAILED: {e}")
+            print(tb.format_exc())
+
+        return state
+
     # ─── Router Functions ──────────────────────────────────────
 
     def route_after_planner(state: AgentState) -> str:
         plan = state.get("plan", {})
         task_type = plan.get("task_type", "simple")
-
         if task_type == "simple":
             return "responder"
         elif task_type == "research":
@@ -46,7 +84,6 @@ def build_graph(model: str = DEFAULT_MODEL):
     def route_after_critic(state: AgentState) -> str:
         critique = state.get("critique", {})
         revision_count = state.get("revision_count", 0)
-
         if critique.get("approved", True) or revision_count >= MAX_REVISIONS:
             return "responder"
         else:
@@ -64,6 +101,7 @@ def build_graph(model: str = DEFAULT_MODEL):
     graph.add_node("coder", coder.run)
     graph.add_node("critic", critic.run)
     graph.add_node("responder", responder.run)
+    graph.add_node("save_episode", save_episode_node)
 
     graph.set_entry_point("planner")
 
@@ -98,7 +136,9 @@ def build_graph(model: str = DEFAULT_MODEL):
         },
     )
 
-    graph.add_edge("responder", END)
+    # Responder → save episode → END
+    graph.add_edge("responder", "save_episode")
+    graph.add_edge("save_episode", END)
 
     return graph.compile()
 
@@ -116,5 +156,4 @@ def get_graph(model: str = DEFAULT_MODEL):
     return _graph
 
 
-# Direct import alias — used by api/main.py
 pipeline = get_graph()

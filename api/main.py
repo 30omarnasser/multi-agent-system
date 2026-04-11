@@ -15,6 +15,7 @@ from memory.redis_memory import RedisMemory
 from memory.postgres_memory import PostgresMemory
 from rag.ingestion import DocumentIngestion
 from rag.retriever import DocumentRetriever
+from memory.episodic_memory import EpisodicMemory
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ short_term_memory = RedisMemory(ttl_seconds=3600)
 long_term_memory = PostgresMemory()
 doc_ingestion = DocumentIngestion()
 doc_retriever = DocumentRetriever()
+episodic_memory = EpisodicMemory()
 
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
@@ -157,6 +159,32 @@ def chat(request: ChatRequest):
 @app.post("/multi-agent", response_model=MultiAgentResponse)
 def multi_agent(request: MultiAgentRequest):
     try:
+        # ── Step 1: Save user message to Redis BEFORE pipeline runs ──
+        # This ensures save_episode_node can read it from Redis
+        try:
+            short_term_memory.save_message(
+                request.session_id, "user", request.message
+            )
+            print(f"[API] Saved user message to Redis for '{request.session_id}'")
+        except Exception as e:
+            print(f"[API] Redis pre-save failed: {e}")
+
+        # ── Step 2: Recall relevant past episodes ─────────────────────
+        episode_context = ""
+        try:
+            past_episodes = episodic_memory.search_episodes(
+                query=request.message,
+                top_k=3,
+                threshold=0.3,
+                exclude_session=request.session_id,
+            )
+            if past_episodes:
+                episode_context = episodic_memory.format_episodes_for_prompt(past_episodes)
+                print(f"[API] 🧠 Recalled {len(past_episodes)} past episodes")
+        except Exception as e:
+            print(f"[API] Episode recall failed (non-critical): {e}")
+
+        # ── Step 3: Build initial state and run pipeline ──────────────
         initial_state: AgentState = {
             "user_message": request.message,
             "plan": {},
@@ -170,6 +198,7 @@ def multi_agent(request: MultiAgentRequest):
             "search_queries": [],
             "code_requirements": [],
             "doc_context": "",
+            "episode_context": episode_context,
         }
 
         print(f"\n{'=' * 55}")
@@ -178,7 +207,19 @@ def multi_agent(request: MultiAgentRequest):
 
         final_state = pipeline.invoke(initial_state)
 
-        # Track which agents actually ran
+        # ── Step 4: Save assistant response to Redis AFTER pipeline ───
+        # save_episode_node already ran inside pipeline, but we save
+        # the response here for future episode recalls
+        try:
+            short_term_memory.save_message(
+                request.session_id, "assistant",
+                final_state.get("final_response", "")
+            )
+            print(f"[API] Saved assistant response to Redis for '{request.session_id}'")
+        except Exception as e:
+            print(f"[API] Redis post-save failed: {e}")
+
+        # ── Step 5: Build response ────────────────────────────────────
         agents_used = []
         if final_state.get("plan"):
             agents_used.append("planner")
@@ -379,3 +420,33 @@ def compare_search_modes(
             "results": [{"text": r["text"][:100], "score": r.get("rrf_score")} for r in hybrid_results],
         },
     }
+
+
+# ─── Episodic Memory Endpoints ────────────────────────────────
+
+@app.get("/episodes")
+def get_all_episodes(session_id: str = None):
+    episodes = episodic_memory.get_all_episodes(session_id=session_id)
+    return {"count": len(episodes), "episodes": episodes}
+
+
+@app.get("/episodes/search")
+def search_episodes(query: str, top_k: int = 3, threshold: float = 0.3):
+    episodes = episodic_memory.search_episodes(
+        query=query,
+        top_k=top_k,
+        threshold=threshold,
+    )
+    return {"query": query, "count": len(episodes), "episodes": episodes}
+
+
+@app.get("/episodes/recent")
+def get_recent_episodes(limit: int = 5):
+    episodes = episodic_memory.get_recent_episodes(limit=limit)
+    return {"count": len(episodes), "episodes": episodes}
+
+
+@app.delete("/episodes/{episode_id}")
+def delete_episode(episode_id: int):
+    episodic_memory.delete_episode(episode_id)
+    return {"message": f"Episode {episode_id} deleted"}
