@@ -14,7 +14,14 @@ Your response must:
 - Be well-structured with clear sections if the response is long
 - Never mention the internal agent names (Planner, Researcher, Coder, Critic)
 - Sound like one coherent expert answer, not a collection of parts
-- If past conversation context is provided, use it naturally to give continuity
+
+Personalization rules (if user profile is provided):
+- Match their expertise level (simpler for beginners, technical for experts)
+- Use their preferred communication style
+- Reference their known interests where relevant
+- Use their name if you know it
+
+If past conversation context is provided, reference it naturally for continuity.
 
 If only research was done: summarize findings in a clear, readable way.
 If only code was done: explain what was built and show the results.
@@ -38,8 +45,13 @@ class ResponderAgent:
         critique = state.get("critique", {})
         plan = state.get("plan", {})
         episode_context = state.get("episode_context", "")
+        profile_context = state.get("profile_context", "")  # ← NEW
 
         print(f"\n[ResponderAgent] Synthesizing final response...")
+        if profile_context:
+            print(f"[ResponderAgent] 👤 Using profile context")
+        if episode_context:
+            print(f"[ResponderAgent] 🧠 Using episode context")
 
         context = self._build_context(
             user_message=user_message,
@@ -48,6 +60,7 @@ class ResponderAgent:
             plan=plan,
             critique=critique,
             episode_context=episode_context,
+            profile_context=profile_context,
         )
 
         try:
@@ -80,22 +93,26 @@ class ResponderAgent:
         plan: dict,
         critique: dict,
         episode_context: str = "",
+        profile_context: str = "",
     ) -> str:
-
-        # Simple tasks — answer directly
-        if plan.get("task_type") == "simple":
-            context = f"User request: {user_message}\n"
-            if episode_context:
-                context += (
-                    f"\nFor context, here are relevant past conversations:\n"
-                    f"{episode_context}\n"
-                )
-            context += "\nAnswer this directly and conversationally."
-            return context
 
         context = f"User's original request: {user_message}\n\n"
 
-        # Inject past episode context if available
+        # Inject profile context first — shapes everything that follows
+        if profile_context:
+            context += f"{profile_context}\n\n"
+
+        # Simple tasks — answer directly
+        if plan.get("task_type") == "simple":
+            if episode_context:
+                context += (
+                    f"Relevant past conversation context:\n"
+                    f"{episode_context}\n\n"
+                )
+            context += "Answer this directly and conversationally."
+            return context
+
+        # Inject past episode context
         if episode_context:
             context += (
                 f"Relevant past conversation context:\n"

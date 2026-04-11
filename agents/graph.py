@@ -19,24 +19,21 @@ def build_graph(model: str = DEFAULT_MODEL):
     critic = CriticAgent(model=model)
     responder = ResponderAgent(model=model)
 
-    # ─── Episodic Memory Node ──────────────────────────────────
+    # ─── Episode Save Node ─────────────────────────────────────
 
     def save_episode_node(state: AgentState) -> AgentState:
-        print(f"[Graph] save_episode_node triggered | session: {state.get('session_id')}")
+        print(f"[Graph] save_episode_node | session: {state.get('session_id')}")
         try:
             from memory.episodic_memory import EpisodicMemory
 
             session_id = state.get("session_id", "default")
             if not session_id or session_id == "default":
-                print(f"[Graph] Skipping — session_id is 'default'")
                 return state
 
-            # Build messages directly from state — no Redis dependency
             user_message = state.get("user_message", "")
             final_response = state.get("final_response", "")
 
             if not user_message or not final_response:
-                print(f"[Graph] Skipping — missing user_message or final_response")
                 return state
 
             messages = [
@@ -55,6 +52,41 @@ def build_graph(model: str = DEFAULT_MODEL):
         except Exception as e:
             import traceback as tb
             print(f"[Graph] Episode save FAILED: {e}")
+            print(tb.format_exc())
+
+        return state
+
+    # ─── Profile Update Node ───────────────────────────────────
+
+    def update_profile_node(state: AgentState) -> AgentState:
+        """Auto-update user profile after each conversation."""
+        print(f"[Graph] update_profile_node | user: {state.get('user_id')}")
+        try:
+            from memory.user_profile import UserProfileMemory
+
+            user_id = state.get("user_id") or state.get("session_id", "default")
+            if not user_id or user_id == "default":
+                print("[Graph] Skipping profile update — no user_id")
+                return state
+
+            user_message = state.get("user_message", "")
+            final_response = state.get("final_response", "")
+
+            if not user_message or not final_response:
+                return state
+
+            profile_memory = UserProfileMemory()
+            profile_memory.auto_update_from_conversation(
+                user_id=user_id,
+                user_message=user_message,
+                assistant_response=final_response,
+                model=model,
+            )
+            print(f"[Graph] ✓ Profile updated for '{user_id}'")
+
+        except Exception as e:
+            import traceback as tb
+            print(f"[Graph] Profile update FAILED: {e}")
             print(tb.format_exc())
 
         return state
@@ -102,6 +134,7 @@ def build_graph(model: str = DEFAULT_MODEL):
     graph.add_node("critic", critic.run)
     graph.add_node("responder", responder.run)
     graph.add_node("save_episode", save_episode_node)
+    graph.add_node("update_profile", update_profile_node)  # ← NEW
 
     graph.set_entry_point("planner")
 
@@ -136,9 +169,10 @@ def build_graph(model: str = DEFAULT_MODEL):
         },
     )
 
-    # Responder → save episode → END
+    # Responder → save episode → update profile → END
     graph.add_edge("responder", "save_episode")
-    graph.add_edge("save_episode", END)
+    graph.add_edge("save_episode", "update_profile")  # ← NEW
+    graph.add_edge("update_profile", END)              # ← NEW
 
     return graph.compile()
 

@@ -16,7 +16,7 @@ from memory.postgres_memory import PostgresMemory
 from rag.ingestion import DocumentIngestion
 from rag.retriever import DocumentRetriever
 from memory.episodic_memory import EpisodicMemory
-
+from memory.user_profile import UserProfileMemory
 load_dotenv()
 
 app = FastAPI(title="Multi-Agent System", version="0.3.0")
@@ -33,7 +33,7 @@ long_term_memory = PostgresMemory()
 doc_ingestion = DocumentIngestion()
 doc_retriever = DocumentRetriever()
 episodic_memory = EpisodicMemory()
-
+user_profile_memory = UserProfileMemory()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -69,6 +69,7 @@ class ChatResponse(BaseModel):
 class MultiAgentRequest(BaseModel):
     message: str
     session_id: str = "default"
+    user_id: str = ""  # ← NEW
 
 class MultiAgentResponse(BaseModel):
     response: str
@@ -168,7 +169,15 @@ def multi_agent(request: MultiAgentRequest):
             print(f"[API] Saved user message to Redis for '{request.session_id}'")
         except Exception as e:
             print(f"[API] Redis pre-save failed: {e}")
-
+        # ── Recall user profile ───────────────────────────────────
+        profile_context = ""
+        try:
+            uid = request.user_id or request.session_id
+            profile_context = user_profile_memory.format_for_prompt(uid)
+            if profile_context:
+                print(f"[API] 👤 Profile context loaded for '{uid}'")
+        except Exception as e:
+            print(f"[API] Profile recall failed (non-critical): {e}")
         # ── Step 2: Recall relevant past episodes ─────────────────────
         episode_context = ""
         try:
@@ -195,10 +204,12 @@ def multi_agent(request: MultiAgentRequest):
             "final_response": "",
             "current_agent": "",
             "session_id": request.session_id,
+            "user_id": request.user_id or request.session_id,  # ← NEW
             "search_queries": [],
             "code_requirements": [],
             "doc_context": "",
             "episode_context": episode_context,
+            "profile_context": profile_context,  # ← NEW
         }
 
         print(f"\n{'=' * 55}")
@@ -450,3 +461,31 @@ def get_recent_episodes(limit: int = 5):
 def delete_episode(episode_id: int):
     episodic_memory.delete_episode(episode_id)
     return {"message": f"Episode {episode_id} deleted"}
+# ─── User Profile Endpoints ───────────────────────────────────
+
+@app.get("/profile/{user_id}")
+def get_profile(user_id: str):
+    """Get a user's profile."""
+    profile = user_profile_memory.get_profile(user_id)
+    return profile
+
+
+@app.put("/profile/{user_id}")
+def update_profile(user_id: str, updates: dict):
+    """Manually update a user profile."""
+    profile = user_profile_memory.update_profile(user_id, updates)
+    return profile
+
+
+@app.get("/profiles")
+def list_profiles():
+    """List all user profiles."""
+    profiles = user_profile_memory.list_profiles()
+    return {"count": len(profiles), "profiles": profiles}
+
+
+@app.delete("/profile/{user_id}")
+def delete_profile(user_id: str):
+    """Delete a user profile."""
+    user_profile_memory.delete_profile(user_id)
+    return {"message": f"Profile deleted for '{user_id}'"}

@@ -15,7 +15,7 @@ class AgentState(TypedDict):
     code_output: str
 
     # Critic evaluation
-    critique: dict  # {score, feedback, approved, issues}
+    critique: dict
 
     # Revision cycle count
     revision_count: int
@@ -26,15 +26,17 @@ class AgentState(TypedDict):
     # Active agent name
     current_agent: str
 
-    # Session info
+    # Session / user info
     session_id: str
+    user_id: str          # ← NEW: for profile lookup
 
-    # Planner hints for downstream agents
+    # Planner hints
     search_queries: list
     code_requirements: list
 
-    # RAG context from documents
+    # RAG context
     doc_context: str
 
-    # Episodic memory context injected at start
+    # Memory contexts injected at start
     episode_context: str
+    profile_context: str  # ← NEW: user profile context
