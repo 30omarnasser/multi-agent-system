@@ -18,7 +18,7 @@ from rag.retriever import DocumentRetriever
 from memory.episodic_memory import EpisodicMemory
 from memory.user_profile import UserProfileMemory
 load_dotenv()
-
+from memory.memory_manager import MemoryManager
 app = FastAPI(title="Multi-Agent System", version="0.3.0")
 
 # ─── Services Setup ───────────────────────────────────────────
@@ -34,6 +34,7 @@ doc_ingestion = DocumentIngestion()
 doc_retriever = DocumentRetriever()
 episodic_memory = EpisodicMemory()
 user_profile_memory = UserProfileMemory()
+memory_manager = MemoryManager()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -489,3 +490,72 @@ def delete_profile(user_id: str):
     """Delete a user profile."""
     user_profile_memory.delete_profile(user_id)
     return {"message": f"Profile deleted for '{user_id}'"}
+# ─── Memory Management Endpoints ─────────────────────────────
+
+@app.get("/memory/stats")
+def get_memory_stats():
+    """Full memory dashboard — stats across all memory systems."""
+    stats = memory_manager.get_memory_stats()
+    return stats
+
+
+@app.post("/memory/maintenance")
+def run_maintenance(
+    prune_facts_days: int = 30,
+    prune_episodes_days: int = 60,
+    deduplicate: bool = True,
+):
+    """Run full memory maintenance — prune old data, deduplicate."""
+    report = memory_manager.run_maintenance(
+        prune_facts_days=prune_facts_days,
+        prune_episodes_days=prune_episodes_days,
+        deduplicate=deduplicate,
+    )
+    return report
+
+
+@app.post("/memory/prune-facts")
+def prune_facts(days_old: int = 30, session_id: str = None):
+    """Delete facts older than N days."""
+    deleted = memory_manager.prune_old_facts(
+        days_old=days_old,
+        session_id=session_id,
+    )
+    return {"deleted": deleted, "days_old": days_old}
+
+
+@app.post("/memory/prune-episodes")
+def prune_episodes(days_old: int = 60):
+    """Delete episodes older than N days."""
+    deleted = memory_manager.prune_old_episodes(days_old=days_old)
+    return {"deleted": deleted, "days_old": days_old}
+
+
+@app.post("/memory/deduplicate-facts")
+def deduplicate_facts(session_id: str = None):
+    """Remove duplicate facts."""
+    deleted = memory_manager.deduplicate_facts(session_id=session_id)
+    return {"duplicates_removed": deleted}
+
+
+@app.post("/memory/deduplicate-episodes")
+def deduplicate_episodes(similarity_threshold: float = 0.95):
+    """Remove near-duplicate episodes."""
+    deleted = memory_manager.deduplicate_episodes(
+        similarity_threshold=similarity_threshold
+    )
+    return {"duplicates_removed": deleted}
+
+
+@app.get("/memory/summarize-facts/{session_id}")
+def summarize_facts(session_id: str):
+    """Summarize all facts for a session using LLM."""
+    summary = memory_manager.summarize_facts(session_id=session_id)
+    return {"session_id": session_id, "summary": summary}
+
+
+@app.get("/memory/document-stats")
+def get_document_stats():
+    """Per-document chunk counts and sizes."""
+    stats = memory_manager.get_document_stats()
+    return {"count": len(stats), "documents": stats}
