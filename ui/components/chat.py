@@ -36,7 +36,16 @@ def render_chat_sidebar():
             index=0,
         )
         st.session_state.agent_mode = mode
-
+        st.markdown("---")
+    st.markdown("### 🛡️ Human-in-the-Loop")
+    hitl_enabled = st.toggle(
+        "Enable approval checkpoint",
+        value=False,
+        help="Agent will pause and ask for approval before executing high-risk tasks",
+    )
+    st.session_state.hitl_enabled = hitl_enabled
+    if hitl_enabled:
+        st.info("⏸️ Agent will pause before executing code or complex tasks")
         st.markdown("---")
         st.markdown("### 👤 Your Profile")
         try:
@@ -78,8 +87,8 @@ def render_message(role: str, content: str, metadata: dict = None):
 
 
 def send_message(message: str, session_id: str, user_id: str) -> dict:
-    """Send message to the appropriate API endpoint."""
     mode = st.session_state.get("agent_mode", "Multi-Agent Pipeline")
+    hitl_enabled = st.session_state.get("hitl_enabled", False)
 
     if mode == "Multi-Agent Pipeline":
         r = requests.post(
@@ -88,16 +97,14 @@ def send_message(message: str, session_id: str, user_id: str) -> dict:
                 "message": message,
                 "session_id": session_id,
                 "user_id": user_id,
+                "hitl_enabled": hitl_enabled,
             },
-            timeout=120,
+            timeout=180,  # longer timeout for HITL
         )
     else:
         r = requests.post(
             f"{API_URL}/chat",
-            json={
-                "message": message,
-                "session_id": session_id,
-            },
+            json={"message": message, "session_id": session_id},
             timeout=60,
         )
 
@@ -122,6 +129,77 @@ def render_chat_interface():
             content=msg["content"],
             metadata=msg.get("metadata"),
         )
+def render_hitl_approval_panel():
+    """Show pending HITL requests and approval buttons."""
+    try:
+        r = requests.get(f"{API_URL}/hitl/pending", timeout=5)
+        if r.status_code != 200:
+            return
+        data = r.json()
+        if data["count"] == 0:
+            return
+
+        st.markdown("---")
+        st.markdown("### ⏸️ Awaiting Your Approval")
+
+        for req in data["requests"]:
+            with st.container():
+                risk_color = {
+                    "high": "🔴",
+                    "medium": "🟡",
+                    "low": "🟢",
+                }.get(req.get("risk_level", "medium"), "🟡")
+
+                st.markdown(
+                    f"{risk_color} **{req['action']}** "
+                    f"(Session: `{req['session_id']}`)"
+                )
+
+                details = req.get("details", {})
+                if details.get("user_message"):
+                    st.caption(f"Task: {details['user_message'][:100]}")
+                if details.get("search_queries"):
+                    st.caption(f"Will search: {details['search_queries']}")
+                if details.get("code_requirements"):
+                    st.caption(f"Will code: {details['code_requirements']}")
+
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    feedback = st.text_input(
+                        "Feedback (optional)",
+                        key=f"feedback_{req['request_id']}",
+                        placeholder="Add guidance or reason...",
+                    )
+                with col2:
+                    if st.button(
+                        "✅ Approve",
+                        key=f"approve_{req['request_id']}",
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        requests.post(
+                            f"{API_URL}/hitl/{req['request_id']}/approve",
+                            params={"feedback": feedback},
+                            timeout=5,
+                        )
+                        st.success("Approved!")
+                        st.rerun()
+                with col3:
+                    if st.button(
+                        "❌ Reject",
+                        key=f"reject_{req['request_id']}",
+                        use_container_width=True,
+                    ):
+                        requests.post(
+                            f"{API_URL}/hitl/{req['request_id']}/reject",
+                            params={"feedback": feedback},
+                            timeout=5,
+                        )
+                        st.error("Rejected!")
+                        st.rerun()
+
+    except Exception:
+        pass       
 
     # Chat input
     if prompt := st.chat_input("Ask anything..."):
@@ -177,3 +255,5 @@ def render_chat_interface():
             "content": response_data.get("response", ""),
             "metadata": response_data,
         })
+# Show HITL approval panel if there are pending requests
+render_hitl_approval_panel()        

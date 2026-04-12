@@ -28,7 +28,7 @@ class AgentState(TypedDict):
 
     # Session / user info
     session_id: str
-    user_id: str          # ← NEW: for profile lookup
+    user_id: str
 
     # Planner hints
     search_queries: list
@@ -39,5 +39,12 @@ class AgentState(TypedDict):
 
     # Memory contexts injected at start
     episode_context: str
-    profile_context: str  # ← NEW: user profile context
-    trace_id: str 
+    profile_context: str
+    trace_id: str
+
+    # ── Human-in-the-loop ─────────────────────────────────────
+    hitl_enabled: bool       # Whether HITL is on for this run
+    hitl_request_id: str     # Current pending request ID
+    hitl_decision: str       # 'approved', 'rejected', 'timeout', ''
+    hitl_feedback: str       # Human's feedback/reason
+    hitl_checkpoint: str     # Which checkpoint triggered HITL
