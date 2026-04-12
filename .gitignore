@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
-.DS_Store
+.DS_Storefrontend/node_modules/
+frontend/build/
