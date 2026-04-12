@@ -187,7 +187,45 @@ User message
          Short-term: full history injected
          Long-term: top-5 relevant facts injected
 ```
+## Week 4 — UI, Evaluation & Control
 
+### Streamlit UI (`http://localhost:8501`)
+A full-featured web interface with:
+- **Chat tab** — real-time chat with agent pipeline visualization
+- **Memory tab** — explore facts, episodes, profiles, run maintenance
+- **Documents tab** — upload PDFs, search knowledge base
+- **About tab** — system architecture and API links
+
+### Agent Trace Viewer
+Every pipeline response includes:
+- Which agents ran and in what order
+- Critique score (0-10)
+- Whether a revision loop was triggered
+- Full task plan with subtasks, search queries, code requirements
+
+### Evaluation Framework
+Automatic scoring of every pipeline run:
+- Tracks accuracy, relevance, completeness, efficiency
+- Rolling averages across all runs
+- Filter by task type, score threshold
+- Accessible at `GET /evaluate/summary`
+
+### MLflow Integration
+Every pipeline run logged to MLflow:
+- Metrics: critique score, duration, agent count
+- Parameters: task type, model, HITL enabled
+- View at `http://localhost:5000`
+
+### Human-in-the-Loop
+Add a pause button to any pipeline run:
+```json
+POST /multi-agent
+{"message": "...", "hitl_enabled": true}
+```
+- Pipeline pauses before executing high-risk operations
+- Approve or reject via API or Streamlit UI
+- Rejected tasks get a graceful abort response
+- Simple tasks automatically skip the checkpoint
 ---
 
 ## What's Coming (Weeks 2–5)
