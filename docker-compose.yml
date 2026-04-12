@@ -10,6 +10,7 @@ services:
     environment:
       - PYTHONPATH=/app
       - OLLAMA_HOST=http://host.docker.internal:11434
+      - MLFLOW_TRACKING_URI=http://host.docker.internal:5000
     depends_on:
       - postgres
       - redis
@@ -25,6 +26,7 @@ services:
     environment:
       - PYTHONPATH=/app
       - API_URL=http://api:8000
+      - MLFLOW_TRACKING_URI=http://host.docker.internal:5000
     command: streamlit run ui/app.py --server.port=8501 --server.address=0.0.0.0
     depends_on:
       - api

@@ -3,6 +3,7 @@ import requests
 import os
 from ui.components.traces import render_trace_viewer
 from ui.components.evaluation import render_evaluation_dashboard
+from ui.components.mlflow_panel import render_mlflow_panel
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
@@ -107,7 +108,8 @@ def render_navigation():
     return st.tabs([
         "💬 Chat",
         "🔍 Traces",
-        "📊 Evaluation",     # ← NEW
+        "📊 Evaluation",
+        "🧪 MLflow",          # ← NEW
         "🧠 Memory",
         "📄 Documents",
         "ℹ️ About",
@@ -181,12 +183,14 @@ def main():
     with tabs[1]:
         render_trace_viewer()
     with tabs[2]:
-        render_evaluation_dashboard()    # ← NEW
+        render_evaluation_dashboard()
     with tabs[3]:
-        render_memory_explorer()
+        render_mlflow_panel()          # ← NEW
     with tabs[4]:
-        render_documents_panel()
+        render_memory_explorer()
     with tabs[5]:
+        render_documents_panel()
+    with tabs[6]:
         render_about()
 
 if __name__ == "__main__":

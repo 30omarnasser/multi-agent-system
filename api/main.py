@@ -22,6 +22,8 @@ load_dotenv()
 from memory.memory_manager import MemoryManager
 from memory.trace_store import TraceStore
 from agents.traced_graph import traced_pipeline
+from evaluation.mlflow_logger import MLflowLogger
+
 app = FastAPI(title="Multi-Agent System", version="0.3.0")
 
 # ─── Services Setup ───────────────────────────────────────────
@@ -41,6 +43,7 @@ memory_manager = MemoryManager()
 trace_store = TraceStore()
 evaluator = EvaluationEngine(model="llama3.1:8b")
 eval_store = EvalStore()
+mlflow_logger = MLflowLogger()
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Respond naturally and conversationally to the user. "
@@ -271,6 +274,7 @@ def multi_agent(request: MultiAgentRequest):
 
         print(f"[Pipeline] ✓ Complete | agents: {agents_used} | {total_duration_ms}ms")
         # ── Evaluate the response asynchronously ──────────────
+        scores = None
         try:
             scores = evaluator.evaluate(
                 user_message=request.message,
@@ -291,6 +295,22 @@ def multi_agent(request: MultiAgentRequest):
             )
         except Exception as e:
             print(f"[API] Evaluation failed (non-critical): {e}")
+            # ── Log to MLflow ──────────────────────────────────────
+        try:
+            mlflow_logger.log_pipeline_run(
+                session_id=request.session_id,
+                user_message=request.message,
+                final_response=final_state.get("final_response", ""),
+                agents_used=agents_used,
+                plan=final_state.get("plan") or {},
+                critique=critique,
+                eval_scores=scores or {},
+                trace_id=trace_id,
+                total_duration_ms=total_duration_ms,
+                had_revision=had_revision,
+            )
+        except Exception as e:
+            print(f"[API] MLflow logging failed (non-critical): {e}")
         return MultiAgentResponse(
             response=final_state.get("final_response", ""),
             session_id=request.session_id,
@@ -306,6 +326,7 @@ def multi_agent(request: MultiAgentRequest):
             status_code=500,
             detail=f"{str(e)}\n{traceback.format_exc()}",
             )
+
 # ─── Session / History ────────────────────────────────────────
 
 @app.get("/history/{session_id}")
@@ -472,7 +493,17 @@ def compare_search_modes(
         },
     }
 
+import math
 
+def clean_json(obj):
+    if isinstance(obj, dict):
+        return {k: clean_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_json(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0
+    return obj
 # ─── Episodic Memory Endpoints ────────────────────────────────
 
 @app.get("/episodes")
@@ -683,3 +714,24 @@ def clear_evaluations(session_id: str = None):
     """Clear all evaluations, optionally for a specific session."""
     deleted = eval_store.clear_evaluations(session_id=session_id)
     return {"deleted": deleted}
+    # ─── MLflow Endpoints ─────────────────────────────────────────
+
+@app.get("/mlflow/summary")
+def get_mlflow_summary():
+    summary = mlflow_logger.get_experiment_summary()
+    return clean_json(summary)
+
+
+@app.get("/mlflow/best")
+def get_best_runs(metric: str = "eval_overall", top_k: int = 5):
+    """Get top K runs by a specific metric."""
+    runs = mlflow_logger.get_best_runs(metric=metric, top_k=top_k)
+    return {"metric": metric, "top_k": top_k, "runs": runs}
+
+
+@app.post("/mlflow/log-memory-stats")
+def log_memory_stats_to_mlflow():
+    """Manually log current memory stats to MLflow."""
+    stats = memory_manager.get_memory_stats()
+    run_id = mlflow_logger.log_memory_stats(stats)
+    return {"run_id": run_id, "stats": stats}
