@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build release image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: |
+            multi-agent-system:${{ github.ref_name }}
+            multi-agent-system:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          body: |
+            ## Multi-Agent AI System ${{ github.ref_name }}
+
+            ### What's included:
+            - 5 specialized AI agents (Planner, Researcher, Coder, Critic, Responder)
+            - LangGraph orchestration with self-correction loops
+            - 5-layer memory (Redis + PostgreSQL + pgvector)
+            - PDF RAG pipeline with hybrid search
+            - Streamlit UI
+            - Human-in-the-loop approval system
+            - MLflow evaluation tracking
+
+            ### Quick Start:
+```bash
+            git clone https://github.com/30omarnasser/multi-agent-system
+            cd multi-agent-system
+            ollama pull llama3.1:8b && ollama pull nomic-embed-text
+            cp .env.example .env  # add your TAVILY_API_KEY
+            docker compose up --build
+```
+
+            API: http://localhost:8000/docs
+            UI: http://localhost:8501
+          draft: false
+          prerelease: false
