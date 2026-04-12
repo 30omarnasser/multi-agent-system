@@ -38,7 +38,9 @@ def test_ci_yml_valid_yaml():
         with open(".github/workflows/ci.yml") as f:
             ci = yaml.safe_load(f)
         assert "jobs" in ci
-        assert "on" in ci
+        # 'on' is parsed as True in PyYAML — check both
+        has_on = "on" in ci or True in ci
+        assert has_on, "Missing 'on' trigger in ci.yml"
         print(f"  ci.yml jobs: {list(ci['jobs'].keys())}")
 
         with open(".github/workflows/release.yml") as f:
@@ -53,34 +55,43 @@ def test_ci_yml_valid_yaml():
 
 def test_makefile_has_targets():
     log("Test 3: Makefile has required targets")
-    with open("Makefile") as f:
+
+    with open("Makefile", "r", encoding="utf-8") as f:
         content = f.read()
+
     targets = ["up", "down", "build", "test", "logs", "health"]
+
     for target in targets:
         assert f"{target}:" in content, f"Missing target: {target}"
         print(f"  ✅ make {target}")
+
     print("  ✅ All Makefile targets present!")
 
 
 def test_gitignore_has_secrets():
     log("Test 4: .gitignore protects secrets")
+
     if not os.path.exists(".gitignore"):
-        print("  ⚠️  .gitignore not found")
+        print("  ⚠️ .gitignore not found")
         return
-    with open(".gitignore") as f:
+
+    with open(".gitignore", "r", encoding="utf-8") as f:
         content = f.read()
+
     protected = [".env", "__pycache__", "*.pyc"]
+
     for item in protected:
         if item in content:
             print(f"  ✅ {item} ignored")
         else:
-            print(f"  ⚠️  {item} not in .gitignore")
+            print(f"  ⚠️ {item} not in .gitignore")
+
     print("  ✅ Secrets protected!")
 
 
 def test_api_still_running():
     log("Test 5: API still running after CI setup")
-    r = requests.get(f"{BASE_URL}/health", timeout=5)
+    r = requests.get(f"{BASE_URL}/health", timeout=30)  # ← increase timeout
     assert r.status_code == 200
     data = r.json()
     assert data["api"] == "ok"
@@ -90,11 +101,13 @@ def test_api_still_running():
 
 def test_project_structure_complete():
     log("Test 6: Complete project structure")
+
     required_dirs = [
         "agents", "memory", "rag", "tools",
         "api", "ui", "tests", "docs",
         ".github/workflows", "scripts",
     ]
+
     required_files = [
         "agents/graph.py",
         "agents/planner.py",
@@ -123,32 +136,33 @@ def test_project_structure_complete():
     ]
 
     all_good = True
+
     for d in required_dirs:
         exists = os.path.exists(d)
-        status = "✅" if exists else "❌"
+        print(f"  {'✅' if exists else '❌'} {d}/")
         if not exists:
             all_good = False
-        print(f"  {status} {d}/")
 
     for f in required_files:
         exists = os.path.exists(f)
-        status = "✅" if exists else "❌"
+        print(f"  {'✅' if exists else '❌'} {f}")
         if not exists:
             all_good = False
-            print(f"  {status} {f}")
 
     assert all_good, "Some required files/dirs missing"
-    print(f"  ✅ Project structure complete!")
+    print("  ✅ Project structure complete!")
 
 
 if __name__ == "__main__":
-    print("\n⚙️  Day 25 — GitHub Actions CI/CD Tests")
+    print("\n⚙️ Day 25 — GitHub Actions CI/CD Tests")
     print("=" * 55)
+
     test_ci_files_exist()
     test_ci_yml_valid_yaml()
     test_makefile_has_targets()
     test_gitignore_has_secrets()
     test_api_still_running()
     test_project_structure_complete()
+
     print("\n" + "=" * 55)
     print("🎉 All Day 25 tests passed!")

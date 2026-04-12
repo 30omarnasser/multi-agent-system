@@ -6,24 +6,25 @@ import psycopg2
 import os
 import traceback
 import math
+import time
+
 from evaluation.evaluator import EvaluationEngine
 from evaluation.eval_store import EvalStore
+from evaluation.mlflow_logger import MLflowLogger
 from agents.base_agent import BaseAgent
-from agents.graph import pipeline
+from agents.traced_graph import traced_pipeline
 from agents.state import AgentState
 from tools.registry import ToolRegistry
 from tools.definitions import calculator_tool, web_search_tool, python_executor_tool
 from memory.redis_memory import RedisMemory
 from memory.postgres_memory import PostgresMemory
-from rag.ingestion import DocumentIngestion
-from rag.retriever import DocumentRetriever
 from memory.episodic_memory import EpisodicMemory
 from memory.user_profile import UserProfileMemory
 from memory.memory_manager import MemoryManager
 from memory.trace_store import TraceStore
-from agents.traced_graph import traced_pipeline
-from evaluation.mlflow_logger import MLflowLogger
 from memory.hitl_store import HITLStore
+from rag.ingestion import DocumentIngestion
+from rag.retriever import DocumentRetriever
 
 load_dotenv()
 
@@ -104,9 +105,10 @@ class FactIn(BaseModel):
     category: str = "general"
     session_id: str = "default"
 
-# ─── Utility Functions ────────────────────────────────────────
+# ─── Utility ──────────────────────────────────────────────────
 
 def clean_json(obj):
+    """Recursively clean NaN/Inf floats from JSON-serializable objects."""
     if isinstance(obj, dict):
         return {k: clean_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -148,14 +150,12 @@ def health_check():
     except Exception as e:
         status["postgres"] = f"error: {str(e)}"
     try:
-        import ollama as ollama_client
-        client = ollama_client.Client(
-            host=os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
-        )
-        client.list()
+        import requests as req
+        ollama_url = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        resp = req.get(ollama_url, timeout=3)
         status["ollama"] = "ok"
     except Exception as e:
-        status["ollama"] = f"error: {str(e)}"
+        status["ollama"] = f"error: {str(e)[:50]}"
     return status
 
 
@@ -190,7 +190,6 @@ def chat(request: ChatRequest):
 
 @app.post("/multi-agent", response_model=MultiAgentResponse)
 def multi_agent(request: MultiAgentRequest):
-    import time
     pipeline_start = time.time()
     try:
         # Save user message to Redis
@@ -246,7 +245,6 @@ def multi_agent(request: MultiAgentRequest):
             "episode_context": episode_context,
             "profile_context": profile_context,
             "trace_id": trace_id,
-            # ── HITL fields ──────────────────────────────────────────
             "hitl_enabled": request.hitl_enabled,
             "hitl_request_id": "",
             "hitl_decision": "",
@@ -264,11 +262,13 @@ def multi_agent(request: MultiAgentRequest):
         # Save assistant response
         try:
             short_term_memory.save_message(
-                request.session_id, "assistant", final_state.get("final_response", "")
+                request.session_id, "assistant",
+                final_state.get("final_response", "")
             )
         except Exception as e:
             print(f"[API] Redis post-save failed: {e}")
 
+        # Build agents_used list
         agents_used = []
         if final_state.get("plan"):
             agents_used.append("planner")
@@ -284,24 +284,26 @@ def multi_agent(request: MultiAgentRequest):
         critique = final_state.get("critique") or {}
         critique_score = int(critique.get("score", 0)) if critique.get("score") else 0
         had_revision = (final_state.get("revision_count", 0) > 1)
-
         total_duration_ms = int((time.time() - pipeline_start) * 1000)
 
         # Complete the trace
-        trace_store.complete_trace(
-            trace_id=trace_id,
-            final_response=final_state.get("final_response", ""),
-            agents_used=agents_used,
-            total_duration_ms=total_duration_ms,
-            critique_score=critique_score,
-            had_revision=had_revision,
-            task_type=final_state.get("plan", {}).get("task_type", "simple"),
-        )
+        try:
+            trace_store.complete_trace(
+                trace_id=trace_id,
+                final_response=final_state.get("final_response", ""),
+                agents_used=agents_used,
+                total_duration_ms=total_duration_ms,
+                critique_score=critique_score,
+                had_revision=had_revision,
+                task_type=final_state.get("plan", {}).get("task_type", "simple"),
+            )
+        except Exception as e:
+            print(f"[API] Trace completion failed: {e}")
 
         print(f"[Pipeline] ✓ Complete | agents: {agents_used} | {total_duration_ms}ms")
 
-        # ── Evaluate the response asynchronously ──────────────
-        scores = None
+        # Evaluate the response
+        scores = {}
         try:
             scores = evaluator.evaluate(
                 user_message=request.message,
@@ -323,7 +325,7 @@ def multi_agent(request: MultiAgentRequest):
         except Exception as e:
             print(f"[API] Evaluation failed (non-critical): {e}")
 
-        # ── Log to MLflow ──────────────────────────────────────
+        # Log to MLflow
         try:
             mlflow_logger.log_pipeline_run(
                 session_id=request.session_id,
@@ -332,7 +334,7 @@ def multi_agent(request: MultiAgentRequest):
                 agents_used=agents_used,
                 plan=final_state.get("plan") or {},
                 critique=critique,
-                eval_scores=scores or {},
+                eval_scores=scores,
                 trace_id=trace_id,
                 total_duration_ms=total_duration_ms,
                 had_revision=had_revision,
@@ -360,8 +362,7 @@ def multi_agent(request: MultiAgentRequest):
         )
 
 
-# ─── All other endpoints (History, Facts, RAG, Memory, Traces, etc.) ───
-# (kept exactly as you provided, only properly placed)
+# ─── Session / History ────────────────────────────────────────
 
 @app.get("/history/{session_id}")
 def get_history(session_id: str):
@@ -390,7 +391,8 @@ def list_sessions():
     ]
 
 
-# Long-term Memory / Facts
+# ─── Long-term Memory / Facts ─────────────────────────────────
+
 @app.get("/facts")
 def get_all_facts(session_id: str = None):
     facts = long_term_memory.get_all_facts(session_id=session_id)
@@ -423,7 +425,8 @@ def clear_facts(session_id: str):
     return {"message": f"All facts cleared for session '{session_id}'"}
 
 
-# RAG / Document Endpoints
+# ─── RAG / Document Endpoints ─────────────────────────────────
+
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
@@ -470,19 +473,36 @@ def search_documents(
         doc_id=doc_id,
         mode=mode,
     )
+    return {"query": query, "mode": mode, "count": len(results), "results": results}
+
+
+@app.get("/search-docs/context")
+def get_doc_context(
+    query: str,
+    top_k: int = 5,
+    doc_id: str = None,
+    mode: str = "hybrid",
+):
+    context = doc_retriever.search_and_format(
+        query=query, top_k=top_k, doc_id=doc_id, mode=mode,
+    )
+    return {"query": query, "mode": mode, "context": context}
+
+
+@app.get("/search-docs/compare")
+def compare_search_modes(query: str, top_k: int = 5, doc_id: str = None):
+    vector_results = doc_retriever.search(query=query, top_k=top_k, doc_id=doc_id, mode="vector")
+    keyword_results = doc_retriever.search(query=query, top_k=top_k, doc_id=doc_id, mode="keyword")
+    hybrid_results = doc_retriever.search(query=query, top_k=top_k, doc_id=doc_id, mode="hybrid")
     return {
         "query": query,
-        "mode": mode,
-        "count": len(results),
-        "results": results,
+        "vector":  {"count": len(vector_results),  "results": [{"text": r["text"][:100], "score": r.get("similarity")} for r in vector_results]},
+        "keyword": {"count": len(keyword_results), "results": [{"text": r["text"][:100], "score": r.get("keyword_score")} for r in keyword_results]},
+        "hybrid":  {"count": len(hybrid_results),  "results": [{"text": r["text"][:100], "score": r.get("rrf_score")} for r in hybrid_results]},
     }
 
 
-# ... [All your other endpoints for episodes, profile, memory, traces, evaluations, mlflow, hitl are kept unchanged below]
-
-# (I stopped pasting here for brevity, but in your actual file, just continue with all the remaining endpoints exactly as you had them — from @app.get("/episodes") down to the end.)
-
-# ─── Episodic Memory Endpoints ────────────────────────────────
+# ─── Episodic Memory ──────────────────────────────────────────
 
 @app.get("/episodes")
 def get_all_episodes(session_id: str = None):
@@ -492,11 +512,7 @@ def get_all_episodes(session_id: str = None):
 
 @app.get("/episodes/search")
 def search_episodes(query: str, top_k: int = 3, threshold: float = 0.3):
-    episodes = episodic_memory.search_episodes(
-        query=query,
-        top_k=top_k,
-        threshold=threshold,
-    )
+    episodes = episodic_memory.search_episodes(query=query, top_k=top_k, threshold=threshold)
     return {"query": query, "count": len(episodes), "episodes": episodes}
 
 
@@ -510,122 +526,99 @@ def get_recent_episodes(limit: int = 5):
 def delete_episode(episode_id: int):
     episodic_memory.delete_episode(episode_id)
     return {"message": f"Episode {episode_id} deleted"}
-# ─── User Profile Endpoints ───────────────────────────────────
+
+
+# ─── User Profiles ────────────────────────────────────────────
 
 @app.get("/profile/{user_id}")
 def get_profile(user_id: str):
-    """Get a user's profile."""
-    profile = user_profile_memory.get_profile(user_id)
-    return profile
+    return user_profile_memory.get_profile(user_id)
 
 
 @app.put("/profile/{user_id}")
 def update_profile(user_id: str, updates: dict):
-    """Manually update a user profile."""
-    profile = user_profile_memory.update_profile(user_id, updates)
-    return profile
+    return user_profile_memory.update_profile(user_id, updates)
 
 
 @app.get("/profiles")
 def list_profiles():
-    """List all user profiles."""
     profiles = user_profile_memory.list_profiles()
     return {"count": len(profiles), "profiles": profiles}
 
 
 @app.delete("/profile/{user_id}")
 def delete_profile(user_id: str):
-    """Delete a user profile."""
     user_profile_memory.delete_profile(user_id)
     return {"message": f"Profile deleted for '{user_id}'"}
-# ─── Memory Management Endpoints ─────────────────────────────
+
+
+# ─── Memory Management ────────────────────────────────────────
 
 @app.get("/memory/stats")
 def get_memory_stats():
-    """Full memory dashboard — stats across all memory systems."""
-    stats = memory_manager.get_memory_stats()
-    return stats
+    return memory_manager.get_memory_stats()
 
 
 @app.post("/memory/maintenance")
-def run_maintenance(
-    prune_facts_days: int = 30,
-    prune_episodes_days: int = 60,
-    deduplicate: bool = True,
-):
-    """Run full memory maintenance — prune old data, deduplicate."""
-    report = memory_manager.run_maintenance(
+def run_maintenance(prune_facts_days: int = 30, prune_episodes_days: int = 60, deduplicate: bool = True):
+    return memory_manager.run_maintenance(
         prune_facts_days=prune_facts_days,
         prune_episodes_days=prune_episodes_days,
         deduplicate=deduplicate,
     )
-    return report
 
 
 @app.post("/memory/prune-facts")
 def prune_facts(days_old: int = 30, session_id: str = None):
-    """Delete facts older than N days."""
-    deleted = memory_manager.prune_old_facts(
-        days_old=days_old,
-        session_id=session_id,
-    )
+    deleted = memory_manager.prune_old_facts(days_old=days_old, session_id=session_id)
     return {"deleted": deleted, "days_old": days_old}
 
 
 @app.post("/memory/prune-episodes")
 def prune_episodes(days_old: int = 60):
-    """Delete episodes older than N days."""
     deleted = memory_manager.prune_old_episodes(days_old=days_old)
     return {"deleted": deleted, "days_old": days_old}
 
 
 @app.post("/memory/deduplicate-facts")
 def deduplicate_facts(session_id: str = None):
-    """Remove duplicate facts."""
     deleted = memory_manager.deduplicate_facts(session_id=session_id)
     return {"duplicates_removed": deleted}
 
 
 @app.post("/memory/deduplicate-episodes")
 def deduplicate_episodes(similarity_threshold: float = 0.95):
-    """Remove near-duplicate episodes."""
-    deleted = memory_manager.deduplicate_episodes(
-        similarity_threshold=similarity_threshold
-    )
+    deleted = memory_manager.deduplicate_episodes(similarity_threshold=similarity_threshold)
     return {"duplicates_removed": deleted}
 
 
 @app.get("/memory/summarize-facts/{session_id}")
 def summarize_facts(session_id: str):
-    """Summarize all facts for a session using LLM."""
     summary = memory_manager.summarize_facts(session_id=session_id)
     return {"session_id": session_id, "summary": summary}
 
 
 @app.get("/memory/document-stats")
 def get_document_stats():
-    """Per-document chunk counts and sizes."""
     stats = memory_manager.get_document_stats()
     return {"count": len(stats), "documents": stats}
-# ─── Trace Endpoints ──────────────────────────────────────────
+
+
+# ─── Traces ───────────────────────────────────────────────────
 
 @app.get("/traces")
 def list_traces(session_id: str = None, limit: int = 20):
-    """List recent pipeline execution traces."""
     traces = trace_store.list_traces(session_id=session_id, limit=limit)
     return {"count": len(traces), "traces": traces}
 
 
 @app.get("/traces/stats")
 def get_trace_stats():
-    """Aggregate performance stats across all traces."""
-    stats = trace_store.get_stats()
-    return stats
+    return trace_store.get_stats()
 
 
 @app.get("/traces/{trace_id}")
 def get_trace(trace_id: str):
-    """Get full trace with all agent spans."""
     trace = trace_store.get_trace(trace_id)
     if not trace:
         raise HTTPException(status_code=404, detail=f"Trace '{trace_id}' not found")
@@ -634,46 +627,33 @@ def get_trace(trace_id: str):
 
 @app.delete("/traces/{trace_id}")
 def delete_trace(trace_id: str):
-    """Delete a trace and all its spans."""
     trace_store.delete_trace(trace_id)
     return {"message": f"Trace '{trace_id}' deleted"}
 
 
 @app.delete("/traces")
 def clear_old_traces(days_old: int = 7):
-    """Delete traces older than N days."""
     deleted = trace_store.clear_old_traces(days_old=days_old)
     return {"deleted": deleted, "days_old": days_old}
-    
-# ─── Evaluation Endpoints ─────────────────────────────────────
+
+
+# ─── Evaluations ──────────────────────────────────────────────
 
 @app.get("/evaluations")
-def list_evaluations(
-    session_id: str = None,
-    task_type: str = None,
-    min_score: int = 0,
-    limit: int = 20,
-):
-    """List evaluation results with optional filters."""
+def list_evaluations(session_id: str = None, task_type: str = None, min_score: int = 0, limit: int = 20):
     evals = eval_store.list_evaluations(
-        session_id=session_id,
-        task_type=task_type,
-        min_score=min_score,
-        limit=limit,
+        session_id=session_id, task_type=task_type, min_score=min_score, limit=limit,
     )
     return {"count": len(evals), "evaluations": evals}
 
 
 @app.get("/evaluations/stats")
 def get_evaluation_stats():
-    """Aggregate quality stats across all evaluations."""
-    stats = eval_store.get_aggregate_stats()
-    return stats
+    return eval_store.get_aggregate_stats()
 
 
 @app.get("/evaluations/{eval_id}")
 def get_evaluation(eval_id: int):
-    """Get a specific evaluation by ID."""
     ev = eval_store.get_evaluation(eval_id)
     if not ev:
         raise HTTPException(status_code=404, detail=f"Evaluation {eval_id} not found")
@@ -682,62 +662,52 @@ def get_evaluation(eval_id: int):
 
 @app.delete("/evaluations/{eval_id}")
 def delete_evaluation(eval_id: int):
-    """Delete a specific evaluation."""
     eval_store.delete_evaluation(eval_id)
     return {"message": f"Evaluation {eval_id} deleted"}
 
 
 @app.delete("/evaluations")
 def clear_evaluations(session_id: str = None):
-    """Clear all evaluations, optionally for a specific session."""
     deleted = eval_store.clear_evaluations(session_id=session_id)
     return {"deleted": deleted}
-    # ─── MLflow Endpoints ─────────────────────────────────────────
+
+
+# ─── MLflow ───────────────────────────────────────────────────
 
 @app.get("/mlflow/summary")
 def get_mlflow_summary():
-    summary = mlflow_logger.get_experiment_summary()
-    return clean_json(summary)
+    return clean_json(mlflow_logger.get_experiment_summary())
 
 
 @app.get("/mlflow/best")
 def get_best_runs(metric: str = "eval_overall", top_k: int = 5):
-    """Get top K runs by a specific metric."""
     runs = mlflow_logger.get_best_runs(metric=metric, top_k=top_k)
     return {"metric": metric, "top_k": top_k, "runs": runs}
 
 
 @app.post("/mlflow/log-memory-stats")
 def log_memory_stats_to_mlflow():
-    """Manually log current memory stats to MLflow."""
     stats = memory_manager.get_memory_stats()
     run_id = mlflow_logger.log_memory_stats(stats)
     return {"run_id": run_id, "stats": stats}
-# ─── Human-in-the-Loop Endpoints ─────────────────────────────
+
+
+# ─── Human-in-the-Loop ────────────────────────────────────────
 
 @app.get("/hitl/pending")
 def get_pending_approvals():
-    """Get all requests waiting for human approval."""
     requests_list = hitl_store.get_pending_requests()
-    return {
-        "count": len(requests_list),
-        "requests": requests_list,
-    }
+    return {"count": len(requests_list), "requests": requests_list}
 
 
 @app.get("/hitl/session/{session_id}")
 def get_session_requests(session_id: str):
-    """Get all HITL requests for a session."""
     requests_list = hitl_store.get_session_requests(session_id)
-    return {
-        "count": len(requests_list),
-        "requests": requests_list,
-    }
+    return {"count": len(requests_list), "requests": requests_list}
 
 
 @app.get("/hitl/{request_id}")
 def get_hitl_request(request_id: str):
-    """Get a specific HITL request by ID."""
     req = hitl_store.get_request(request_id)
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
@@ -746,30 +716,21 @@ def get_hitl_request(request_id: str):
 
 @app.post("/hitl/{request_id}/approve")
 def approve_request(request_id: str, feedback: str = ""):
-    """Approve a pending HITL request."""
     success = hitl_store.approve(request_id, feedback=feedback)
     if not success:
-        raise HTTPException(
-            status_code=404,
-            detail="Request not found or already decided"
-        )
+        raise HTTPException(status_code=404, detail="Request not found or already decided")
     return {"message": f"Request {request_id} approved", "feedback": feedback}
 
 
 @app.post("/hitl/{request_id}/reject")
 def reject_request(request_id: str, feedback: str = ""):
-    """Reject a pending HITL request."""
     success = hitl_store.reject(request_id, feedback=feedback)
     if not success:
-        raise HTTPException(
-            status_code=404,
-            detail="Request not found or already decided"
-        )
+        raise HTTPException(status_code=404, detail="Request not found or already decided")
     return {"message": f"Request {request_id} rejected", "feedback": feedback}
 
 
 @app.delete("/hitl/session/{session_id}")
 def clear_hitl_session(session_id: str):
-    """Clear all HITL requests for a session."""
     hitl_store.clear_session(session_id)
     return {"message": f"HITL requests cleared for session '{session_id}'"}
